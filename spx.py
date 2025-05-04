@@ -26,33 +26,58 @@ def gamma(otype, S, K, T, r, sigma):
 # Data fetching functions  
 @st.cache_data(ttl=60)
 def get_live_data(ticker):
-    data = yf.Ticker(ticker)
-    hist = data.history(period="3d")
-    return {
-        "current": hist.iloc[-1].Close,
-        "2d_high": hist.High[-3:-1].max(),
-        "2d_low": hist.Low[-3:-1].min(),
-        "1d_high": hist.High[-2],
-        "1d_low": hist.Low[-2]
-    }
+    try:
+        data = yf.Ticker(ticker)
+        hist = data.history(period="3d")
+        return {
+            "current": hist.iloc[-1].Close,
+            "2d_high": hist.High[-3:-1].max(),
+            "2d_low": hist.Low[-3:-1].min(),
+            "1d_high": hist.High[-2],
+            "1d_low": hist.Low[-2]
+        }
+    except Exception as e:
+        st.error(f"Error fetching data for {ticker}: {str(e)}")
+        return None
 
 @st.cache_data(ttl=300)
 def get_options_chain(ticker):
-    chain = options.get_options_chain(ticker)
-    return pd.concat([chain["calls"], chain["puts"]])
+    try:
+        chain = options.get_options_chain(ticker)
+        df = pd.concat([chain["calls"], chain["puts"]])
+        if 'Type' not in df.columns:
+            st.error(f"Missing 'Type' column in options data for {ticker}")
+        return df
+    except Exception as e:
+        st.error(f"Error fetching options chain for {ticker}: {str(e)}")
+        return pd.DataFrame()
 
 # Metrics calculations
 def calculate_gamma_exposure(df, spot):
-    df["gamma_contribution"] = df.apply(lambda x: 
-        x["Gamma"] * CONTRACT_SIZES["SPX"] * x["Open Interest"] * spot**2 * 0.01 
-        * (-1 if x["Option Type"] == "put" else 1), axis=1)
-    return df["gamma_contribution"].sum() / 1e9
+    try:
+        df["gamma_contribution"] = df.apply(lambda x: 
+            gamma(x["Type"].lower(), spot, x.Strike, 0.0027, 0.05, 0.2) 
+            * CONTRACT_SIZES["SPX"] 
+            * x["Open Interest"] 
+            * spot**2 
+            * 0.01 
+            * (-1 if x["Type"].lower() == "put" else 1), axis=1)
+        return df["gamma_contribution"].sum() / 1e9
+    except KeyError as e:
+        st.error(f"Missing column in gamma calculation: {str(e)}")
+        return 0
 
 def calculate_delta_exposure(df, spot):
-    df["delta_contribution"] = df.apply(lambda x: 
-        x["Delta"] * CONTRACT_SIZES["SPX"] * x["Open Interest"] * 
-        (1 if x["Option Type"] == "call" else -1), axis=1)
-    return df["delta_contribution"].sum() / 1e9
+    try:
+        df["delta_contribution"] = df.apply(lambda x: 
+            delta(x["Type"].lower(), spot, x.Strike, 0.0027, 0.05, 0.2) 
+            * CONTRACT_SIZES["SPX"] 
+            * x["Open Interest"] 
+            * (1 if x["Type"].lower() == "call" else -1), axis=1)
+        return df["delta_contribution"].sum() / 1e9
+    except KeyError as e:
+        st.error(f"Missing column in delta calculation: {str(e)}")
+        return 0
 
 # Streamlit layout
 def main():
@@ -60,7 +85,12 @@ def main():
     
     # Price columns
     cols = st.columns(3)
-    price_data = {t: get_live_data(TICKERS[t]) for t in TICKERS}
+    price_data = {}
+    for ticker in TICKERS:
+        data = get_live_data(TICKERS[ticker])
+        if data is None:
+            return
+        price_data[ticker] = data
     
     for i, ticker in enumerate(TICKERS):
         with cols[i]:
@@ -75,11 +105,25 @@ def main():
     st.header("Options Metrics")
     for ticker in ["SPX", "SPY"]:
         df = get_options_chain(TICKERS[ticker])
+        if df.empty:
+            continue
+            
         spot = price_data[ticker]["current"]
         
         # Calculate Greeks
-        df["Delta"] = df.apply(lambda x: delta(x["Option Type"], spot, x.Strike, 0.0027, 0.05, 0.2), axis=1)
-        df["Gamma"] = df.apply(lambda x: gamma(x["Option Type"], spot, x.Strike, 0.0027, 0.05, 0.2), axis=1)
+        try:
+            df["Delta"] = df.apply(lambda x: delta(
+                x["Type"].lower(), spot, x.Strike, 
+                0.0027, 0.05, 0.2
+            ), axis=1)
+            
+            df["Gamma"] = df.apply(lambda x: gamma(
+                x["Type"].lower(), spot, x.Strike,
+                0.0027, 0.05, 0.2
+            ), axis=1)
+        except Exception as e:
+            st.error(f"Error calculating Greeks: {str(e)}")
+            continue
         
         # Exposure calculations
         gamma_exposure = calculate_gamma_exposure(df, spot)
