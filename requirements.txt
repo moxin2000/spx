@@ -4,3 +4,4 @@ yahoo-fin
 pandas
 numpy
 scipy
+matplotlib
