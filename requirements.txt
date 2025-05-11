@@ -5,3 +5,9 @@ pandas
 numpy
 scipy
 matplotlib
+requests
+sys
+datetime
+timedelta
+date
+from datetime import datetime, timedelta, date
