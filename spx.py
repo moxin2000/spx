@@ -1,168 +1,206 @@
-import streamlit as st
-import yfinance as yf
 import pandas as pd
 import numpy as np
+import scipy
+from scipy.stats import norm
 import matplotlib.pyplot as plt
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
+import requests
+import sys
 
-# Dashboard setup
-st.set_page_config(layout="wide")
-st.title("SPX/SPY/ES 0DTE Options Dashboard")
+pd.options.display.float_format = '{:,.4f}'.format
 
-# Fetch live data
-@st.cache_data(ttl=60)
-def get_live_data():
-    spx = yf.Ticker("^GSPC")
-    spy = yf.Ticker("SPY")
-    es = yf.Ticker("ES=F")
-    
-    hist = yf.download(["^GSPC", "SPY", "ES=F"], period="3d")["Close"]
-    
-    return {
-        "current": {
-            "SPX": spx.history(period="1d")["Close"].iloc[-1],
-            "SPY": spy.history(period="1d")["Close"].iloc[-1],
-            "ES": es.history(period="1d")["Close"].iloc[-1]
-        },
-        "history": hist
-    }
+# Black-Scholes European-Options Gamma
+def calcGammaEx(S, K, vol, T, r, q, optType, OI):
+    if T == 0 or vol == 0:
+        return 0
 
-data = get_live_data()
+    dp = (np.log(S/K) + (r - q + 0.5*vol**2)*T) / (vol*np.sqrt(T))
+    dm = dp - vol*np.sqrt(T) 
 
-# Current prices
-col1, col2, col3 = st.columns(3)
-col1.markdown(f"**SPX:** ${data['current']['SPX']:.2f}")
-col2.markdown(f"**SPY:** ${data['current']['SPY']:.2f}")
-col3.markdown(f"**ES-Mini:** ${data['current']['ES']:.2f}")
+    if optType == 'call':
+        gamma = np.exp(-q*T) * norm.pdf(dp) / (S * vol * np.sqrt(T))
+        return OI * 100 * S * S * 0.01 * gamma 
+    else: # Gamma is same for calls and puts. This is just to cross-check
+        gamma = K * np.exp(-r*T) * norm.pdf(dm) / (S * S * vol * np.sqrt(T))
+        return OI * 100 * S * S * 0.01 * gamma 
 
-# Historical levels
-st.subheader("Historical Levels")
-hist_data = {
-    "Metric": ["2-Day High", "2-Day Low", "Prev Day High", "Prev Day Low"],
-    "SPX": [
-        data["history"]["^GSPC"].max(),
-        data["history"]["^GSPC"].min(),
-        data["history"]["^GSPC"].iloc[-2:].max(),
-        data["history"]["^GSPC"].iloc[-2:].min()
-    ],
-    "SPY": [
-        data["history"]["SPY"].max(),
-        data["history"]["SPY"].min(),
-        data["history"]["SPY"].iloc[-2:].max(),
-        data["history"]["SPY"].iloc[-2:].min()
-    ],
-    "ES": [
-        data["history"]["ES=F"].max(),
-        data["history"]["ES=F"].min(),
-        data["history"]["ES=F"].iloc[-2:].max(),
-        data["history"]["ES=F"].iloc[-2:].min()
-    ]
-}
-st.dataframe(pd.DataFrame(hist_data).set_index("Metric").style.format("{:.2f}"))
+def isThirdFriday(d):
+    return d.weekday() == 4 and 15 <= d.day <= 21
 
-# Mock options data (replace with actual 0DTE options data)
-st.subheader("0DTE Options Exposure")
-stocks = ["SPX"]
-expiry = datetime.now().strftime("%Y-%m-%d")
+index = sys.argv[1]
 
-# Gamma Exposure Calculation
-stocks = ["SPX"]
-expiry = datetime.now().strftime("%Y-%m-%d")
+# Get options data
+response = requests.get(url="https://cdn.cboe.com/api/global/delayed_quotes/options/_" + index + ".json")
+options = response.json()
 
-# Gamma Exposure Calculation
-@st.cache_data(ttl=60)
-def calculate_gamma_exposure():
-    # Mock data - replace with actual options chain data
-    strikes = np.arange(data['current']['SPX']*0.95, data['current']['SPX']*1.05, 5)
-    call_gamma = np.random.uniform(0, 1, len(strikes))
-    put_gamma = np.random.uniform(0, 1, len(strikes))
-    
-    net_gamma = call_gamma - put_gamma
-    return strikes, net_gamma
+# Get SPX Spot
+spotPrice = options["data"]["close"]
+print(spotPrice)
+fromStrike = 0.8 * spotPrice
+toStrike = 1.2 * spotPrice
 
-# Delta Exposure Calculation
-@st.cache_data(ttl=60)
-def calculate_delta_exposure():
-    strikes = np.arange(data['current']['SPX']*0.95, data['current']['SPX']*1.05, 5)
-    call_delta = np.random.uniform(0, 1, len(strikes))
-    put_delta = np.random.uniform(-1, 0, len(strikes))
-    
-    net_delta = call_delta + put_delta
-    return strikes, net_delta
+# Get Today's Date
+todayDate = date.today()
 
-# OI and Volume
-@st.cache_data(ttl=60)
-def get_oi_volume():
-    strikes = np.arange(data['current']['SPX']*0.95, data['current']['SPX']*1.05, 5)
-    call_oi = np.random.randint(100, 1000, len(strikes))
-    put_oi = np.random.randint(100, 1000, len(strikes))
-    call_vol = np.random.randint(10, 500, len(strikes))
-    put_vol = np.random.randint(10, 500, len(strikes))
-    return strikes, call_oi, put_oi, call_vol, put_vol
+# Get SPX Options Data
+data_df = pd.DataFrame(options["data"]["options"])
 
-# Dynamic Hedge Calculation
-def calculate_dynamic_hedge(gamma_exposure):
-    # Simplified version based on traderade principles
-    # Find strike where gamma exposure crosses zero
-    strikes, net_gamma = gamma_exposure
-    zero_cross_idx = np.where(np.diff(np.sign(net_gamma)))[0]
-    
-    if len(zero_cross_idx) > 0:
-        hedge_strike = strikes[zero_cross_idx[0]]
-    else:
-        hedge_strike = data['current']['SPX']
-    
-    return hedge_strike
+data_df['CallPut'] = data_df['option'].str.slice(start=-9,stop=-8)
+data_df['ExpirationDate'] = data_df['option'].str.slice(start=-15,stop=-9)
+data_df['ExpirationDate'] = pd.to_datetime(data_df['ExpirationDate'], format='%y%m%d')
+data_df['Strike'] = data_df['option'].str.slice(start=-8,stop=-3)
+data_df['Strike'] = data_df['Strike'].str.lstrip('0')
 
-# Plotting
-strikes, net_gamma = calculate_gamma_exposure()
-strikes_d, net_delta = calculate_delta_exposure()
-strikes_ov, call_oi, put_oi, call_vol, put_vol = get_oi_volume()
+data_df_calls = data_df.loc[data_df['CallPut'] == "C"]
+data_df_puts = data_df.loc[data_df['CallPut'] == "P"]
+data_df_calls = data_df_calls.reset_index(drop=True)
+data_df_puts = data_df_puts.reset_index(drop=True)
 
-# Gamma Exposure Plot
-fig1, ax1 = plt.subplots()
-ax1.bar(strikes, np.where(net_gamma > 0, net_gamma, 0), color='green', label='Positive Gamma')
-ax1.bar(strikes, np.where(net_gamma < 0, net_gamma, 0), color='red', label='Negative Gamma')
-ax1.set_title("Net Gamma Exposure")
-ax1.legend()
+df = data_df_calls[['ExpirationDate','option','last_trade_price','change','bid','ask','volume','iv','delta','gamma','open_interest','Strike']]
+df_puts = data_df_puts[['ExpirationDate','option','last_trade_price','change','bid','ask','volume','iv','delta','gamma','open_interest','Strike']]
+df_puts.columns = ['put_exp','put_option','put_last_trade_price','put_change','put_bid','put_ask','put_volume','put_iv','put_delta','put_gamma','put_open_interest','put_strike']
 
-# Delta Exposure Plot
-fig2, ax2 = plt.subplots()
-ax2.bar(strikes_d, np.where(net_delta > 0, net_delta, 0), color='green', label='Positive Delta')
-ax2.bar(strikes_d, np.where(net_delta < 0, net_delta, 0), color='red', label='Negative Delta')
-ax2.set_title("Net Delta Exposure")
-ax2.legend()
+df = pd.concat([df, df_puts], axis=1)
 
-# OI Plot
-fig3, ax3 = plt.subplots()
-ax3.bar(strikes_ov, call_oi, color='green', label='Call OI')
-ax3.bar(strikes_ov, put_oi, color='red', label='Put OI')
-ax3.set_title("Open Interest")
-ax3.legend()
+df['check'] = np.where((df['ExpirationDate'] == df['put_exp']) & (df['Strike'] == df['put_strike']), 0, 1)
 
-# Volume Plot
-fig4, ax4 = plt.subplots()
-ax4.bar(strikes_ov, call_vol, color='green', label='Call Volume')
-ax4.bar(strikes_ov, put_vol, color='red', label='Put Volume')
-ax4.set_title("Volume")
-ax4.legend()
+if df['check'].sum() != 0:
+    print("PUT CALL MERGE FAILED - OPTIONS ARE MISMATCHED.")
+    exit()
 
-# Display plots
-col1, col2 = st.columns(2)
-col1.pyplot(fig1)
-col2.pyplot(fig2)
+df.drop(['put_exp', 'put_strike', 'check'], axis=1, inplace=True)
 
-col3, col4 = st.columns(2)
-col3.pyplot(fig3)
-col4.pyplot(fig4)
+print(df)
 
-# Dynamic Hedge Calculation
-hedge_strike = calculate_dynamic_hedge((strikes, net_gamma))
-st.markdown(f"**Dynamic Hedge Strike (Gamma Neutral):** ${hedge_strike:.2f}")
+df.columns = ['ExpirationDate','Calls','CallLastSale','CallNet','CallBid','CallAsk','CallVol',
+              'CallIV','CallDelta','CallGamma','CallOpenInt','StrikePrice','Puts','PutLastSale',
+              'PutNet','PutBid','PutAsk','PutVol','PutIV','PutDelta','PutGamma','PutOpenInt']
 
-# Explanation
-st.markdown("""
-**Dynamic Hedge Explanation:**  
-Based on Traderade principles, this calculates the strike price where gamma exposure crosses zero, 
-indicating where market makers would need to adjust their futures hedges to remain delta neutral.
-""")
+df['ExpirationDate'] = pd.to_datetime(df['ExpirationDate'], format='%a %b %d %Y')
+df['ExpirationDate'] = df['ExpirationDate'] + timedelta(hours=16)
+df['StrikePrice'] = df['StrikePrice'].astype(float)
+df['CallIV'] = df['CallIV'].astype(float)
+df['PutIV'] = df['PutIV'].astype(float)
+df['CallGamma'] = df['CallGamma'].astype(float)
+df['PutGamma'] = df['PutGamma'].astype(float)
+df['CallOpenInt'] = df['CallOpenInt'].astype(float)
+df['PutOpenInt'] = df['PutOpenInt'].astype(float)
+
+
+# ---=== CALCULATE SPOT GAMMA ===---
+# Gamma Exposure = Unit Gamma * Open Interest * Contract Size * Spot Price 
+# To further convert into 'per 1% move' quantity, multiply by 1% of spotPrice
+df['CallGEX'] = df['CallGamma'] * df['CallOpenInt'] * 100 * spotPrice * spotPrice * 0.01
+df['PutGEX'] = df['PutGamma'] * df['PutOpenInt'] * 100 * spotPrice * spotPrice * 0.01 * -1
+
+df['TotalGamma'] = (df.CallGEX + df.PutGEX) / 10**9
+dfAgg = df.groupby(['StrikePrice']).sum(numeric_only=True)
+strikes = dfAgg.index.values
+
+# Chart 1: Absolute Gamma Exposure
+plt.grid()
+plt.bar(strikes, dfAgg['TotalGamma'].to_numpy(), width=6, linewidth=0.1, edgecolor='k', label="Gamma Exposure")
+plt.xlim([fromStrike, toStrike])
+chartTitle = "Total Gamma: $" + str("{:.2f}".format(df['TotalGamma'].sum())) + " Bn per 1% " + index + " Move"
+plt.title(chartTitle, fontweight="bold", fontsize=20)
+plt.xlabel('Strike', fontweight="bold")
+plt.ylabel('Spot Gamma Exposure ($ billions/1% move)', fontweight="bold")
+plt.axvline(x=spotPrice, color='r', lw=1, label=index + " Spot: " + str("{:,.0f}".format(spotPrice)))
+plt.legend()
+plt.show()
+
+# Chart 2: Open Interest by Calls and Puts
+plt.grid()
+plt.bar(strikes, dfAgg['CallOpenInt'].to_numpy(), width=6, linewidth=0.1, edgecolor='k', label="Call OI")
+plt.bar(strikes, -1 * dfAgg['PutOpenInt'].to_numpy(), width=6, linewidth=0.1, edgecolor='k', label="Put OI")
+plt.xlim([fromStrike, toStrike])
+chartTitle = "Total Open Interest for " + index
+plt.title(chartTitle, fontweight="bold", fontsize=20)
+plt.xlabel('Strike', fontweight="bold")
+plt.ylabel('Open Interest (number of contracts)', fontweight="bold")
+plt.axvline(x=spotPrice, color='r', lw=1, label=index + " Spot:" + str("{:,.0f}".format(spotPrice)))
+plt.legend()
+plt.show()
+
+# Chart 3: Absolute Gamma Exposure by Calls and Puts
+plt.grid()
+plt.bar(strikes, dfAgg['CallGEX'].to_numpy() / 10**9, width=6, linewidth=0.1, edgecolor='k', label="Call Gamma")
+plt.bar(strikes, dfAgg['PutGEX'].to_numpy() / 10**9, width=6, linewidth=0.1, edgecolor='k', label="Put Gamma")
+plt.xlim([fromStrike, toStrike])
+chartTitle = "Total Gamma: $" + str("{:.2f}".format(df['TotalGamma'].sum())) + " Bn per 1% " + index + " Move"
+plt.title(chartTitle, fontweight="bold", fontsize=20)
+plt.xlabel('Strike', fontweight="bold")
+plt.ylabel('Spot Gamma Exposure ($ billions/1% move)', fontweight="bold")
+plt.axvline(x=spotPrice, color='r', lw=1, label=index + " Spot:" + str("{:,.0f}".format(spotPrice)))
+plt.legend()
+plt.show()
+
+# ---=== CALCULATE GAMMA PROFILE ===---
+levels = np.linspace(fromStrike, toStrike, 30)
+
+# For 0DTE options, I'm setting DTE = 1 day, otherwise they get excluded
+df['daysTillExp'] = [1/262 if (np.busday_count(todayDate, x.date())) == 0 \
+                           else np.busday_count(todayDate, x.date())/262 for x in df.ExpirationDate]
+
+nextExpiry = df['ExpirationDate'].min()
+
+df['IsThirdFriday'] = [isThirdFriday(x) for x in df.ExpirationDate]
+thirdFridays = df.loc[df['IsThirdFriday'] == True]
+nextMonthlyExp = thirdFridays['ExpirationDate'].min()
+
+totalGamma = []
+totalGammaExNext = []
+totalGammaExFri = []
+
+# For each spot level, calc gamma exposure at that point
+for level in levels:
+    df['callGammaEx'] = df.apply(lambda row : calcGammaEx(level, row['StrikePrice'], row['CallIV'], 
+                                                          row['daysTillExp'], 0, 0, "call", row['CallOpenInt']), axis = 1)
+
+    df['putGammaEx'] = df.apply(lambda row : calcGammaEx(level, row['StrikePrice'], row['PutIV'], 
+                                                         row['daysTillExp'], 0, 0, "put", row['PutOpenInt']), axis = 1)    
+
+    totalGamma.append(df['callGammaEx'].sum() - df['putGammaEx'].sum())
+
+    exNxt = df.loc[df['ExpirationDate'] != nextExpiry]
+    totalGammaExNext.append(exNxt['callGammaEx'].sum() - exNxt['putGammaEx'].sum())
+
+    exFri = df.loc[df['ExpirationDate'] != nextMonthlyExp]
+    totalGammaExFri.append(exFri['callGammaEx'].sum() - exFri['putGammaEx'].sum())
+
+totalGamma = np.array(totalGamma) / 10**9
+totalGammaExNext = np.array(totalGammaExNext) / 10**9
+totalGammaExFri = np.array(totalGammaExFri) / 10**9
+
+# Find Gamma Flip Point
+zeroCrossIdx = np.where(np.diff(np.sign(totalGamma)))[0]
+
+negGamma = totalGamma[zeroCrossIdx]
+posGamma = totalGamma[zeroCrossIdx+1]
+negStrike = levels[zeroCrossIdx]
+posStrike = levels[zeroCrossIdx+1]
+
+# Writing and sharing this code is only possible with your support! 
+# If you find it useful, consider supporting us at perfiliev.com/support :)
+zeroGamma = posStrike - ((posStrike - negStrike) * posGamma/(posGamma-negGamma))
+zeroGamma = zeroGamma[0]
+
+# Chart 4: Gamma Exposure Profile
+fig, ax = plt.subplots()
+plt.grid()
+plt.plot(levels, totalGamma, label="All Expiries")
+plt.plot(levels, totalGammaExNext, label="Ex-Next Expiry")
+plt.plot(levels, totalGammaExFri, label="Ex-Next Monthly Expiry")
+chartTitle = "Gamma Exposure Profile, " + index + ", " + todayDate.strftime('%d %b %Y')
+plt.title(chartTitle, fontweight="bold", fontsize=20)
+plt.xlabel('Index Price', fontweight="bold")
+plt.ylabel('Gamma Exposure ($ billions/1% move)', fontweight="bold")
+plt.axvline(x=spotPrice, color='r', lw=1, label=index + " Spot: " + str("{:,.0f}".format(spotPrice)))
+plt.axvline(x=zeroGamma, color='g', lw=1, label="Gamma Flip: " + str("{:,.0f}".format(zeroGamma)))
+plt.axhline(y=0, color='grey', lw=1)
+plt.xlim([fromStrike, toStrike])
+trans = ax.get_xaxis_transform()
+plt.fill_between([fromStrike, zeroGamma], min(totalGamma), max(totalGamma), facecolor='red', alpha=0.1, transform=trans)
+plt.fill_between([zeroGamma, toStrike], min(totalGamma), max(totalGamma), facecolor='green', alpha=0.1, transform=trans)
+plt.legend()
+plt.show()
